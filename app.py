@@ -3,8 +3,11 @@ import pandas as pd
 import re
 import dns.resolver
 import time
-from io import StringIO
+from io import StringIO, BytesIO
 import base64
+import smtplib
+import socket
+from zipfile import ZipFile
 
 # List of common disposable email domains
 DISPOSABLE_DOMAINS = {
@@ -35,7 +38,49 @@ def is_disposable_email(email):
     except:
         return False
 
-def validate_email(email, seen_emails):
+def verify_smtp(email, timeout=10):
+    """
+    Verify email exists via SMTP connection
+    Returns: (is_valid, reason)
+    """
+    try:
+        # Extract domain
+        domain = email.split('@')[1]
+        
+        # Get MX records
+        try:
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            mx_host = str(mx_records[0].exchange)
+        except:
+            return False, "No MX record"
+        
+        # Connect to SMTP server
+        server = smtplib.SMTP(timeout=timeout)
+        server.set_debuglevel(0)
+        
+        # Connect to MX host
+        server.connect(mx_host)
+        server.helo(server.local_hostname)
+        server.mail('verify@example.com')
+        code, message = server.rcpt(email)
+        server.quit()
+        
+        # Check response code
+        if code == 250:
+            return True, "Valid"
+        else:
+            return False, "SMTP rejected"
+            
+    except smtplib.SMTPServerDisconnected:
+        return None, "Server disconnected"
+    except smtplib.SMTPConnectError:
+        return None, "Connection failed"
+    except socket.timeout:
+        return None, "Timeout"
+    except Exception as e:
+        return None, f"SMTP check failed"
+
+def validate_email(email, seen_emails, use_smtp=False, rate_limit_delay=1.5):
     """
     Comprehensive email validation
     Returns: (is_valid, reason)
@@ -68,9 +113,17 @@ def validate_email(email, seen_emails):
     if not check_mx_record(domain):
         return False, "No MX record"
     
+    # SMTP verification (optional, slower)
+    if use_smtp:
+        time.sleep(rate_limit_delay)  # Rate limiting
+        smtp_valid, smtp_reason = verify_smtp(email_str)
+        if smtp_valid is False:
+            return False, smtp_reason
+        # If smtp_valid is None (connection error), continue without SMTP result
+    
     return True, "Valid"
 
-def process_csv(df, progress_bar, status_text):
+def process_csv(df, progress_bar, status_text, use_smtp=False):
     """Process the CSV and validate emails"""
     total_rows = len(df)
     seen_emails = set()
@@ -89,7 +142,8 @@ def process_csv(df, progress_bar, status_text):
             avg_time_per_row = elapsed / (idx + 1)
             remaining_rows = total_rows - (idx + 1)
             eta_seconds = avg_time_per_row * remaining_rows
-            eta_text = f"Processing... {idx + 1}/{total_rows} | ETA: {eta_seconds:.1f}s"
+            smtp_status = " (with SMTP)" if use_smtp else ""
+            eta_text = f"Processing{smtp_status}... {idx + 1}/{total_rows} | ETA: {eta_seconds:.1f}s"
         else:
             eta_text = f"Processing... {idx + 1}/{total_rows}"
         
@@ -97,7 +151,7 @@ def process_csv(df, progress_bar, status_text):
         
         # Validate email
         email = row['Email Address']
-        is_valid, reason = validate_email(email, seen_emails)
+        is_valid, reason = validate_email(email, seen_emails, use_smtp=use_smtp)
         
         if is_valid:
             seen_emails.add(str(email).strip().lower())
@@ -114,11 +168,33 @@ def process_csv(df, progress_bar, status_text):
     
     return df, valid_count, invalid_count
 
-def get_download_link(df):
-    """Generate a download link for the cleaned CSV"""
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()
-    return f'<a href="data:file/csv;base64,{b64}" download="cleaned_emails.csv">Download Cleaned CSV</a>'
+def create_download_zip(df):
+    """Generate a ZIP file with full results, valid emails, and invalid emails"""
+    # Create a BytesIO buffer for the ZIP
+    zip_buffer = BytesIO()
+    
+    with ZipFile(zip_buffer, 'w') as zip_file:
+        # Full results CSV
+        full_csv = df.to_csv(index=False)
+        zip_file.writestr('full_results.csv', full_csv)
+        
+        # Valid emails only CSV
+        valid_df = df[df['Status'] == 'Valid']
+        valid_csv = valid_df.to_csv(index=False)
+        zip_file.writestr('valid_emails.csv', valid_csv)
+        
+        # Invalid emails only CSV
+        invalid_df = df[df['Status'] != 'Valid']
+        invalid_csv = invalid_df.to_csv(index=False)
+        zip_file.writestr('invalid_emails.csv', invalid_csv)
+    
+    zip_buffer.seek(0)
+    return zip_buffer
+
+def get_download_link(zip_buffer):
+    """Generate a download link for the ZIP file"""
+    b64 = base64.b64encode(zip_buffer.read()).decode()
+    return f'<a href="data:application/zip;base64,{b64}" download="email_results.zip">Download Results (ZIP)</a>'
 
 # Streamlit App
 st.set_page_config(page_title="Email Cleaner", page_icon="✉️", layout="wide")
@@ -149,6 +225,16 @@ if uploaded_file is not None:
         st.subheader("📋 Preview of Original Data")
         st.dataframe(df.head(10), use_container_width=True)
         
+        # SMTP verification option
+        use_smtp = st.checkbox(
+            "🔍 Enable SMTP Verification (More accurate but slower - adds ~1.5s per email)",
+            value=False,
+            help="Connects to mail servers to verify if specific email addresses exist. This is more thorough but significantly slower."
+        )
+        
+        if use_smtp:
+            st.warning("⚠️ SMTP verification enabled. Processing will be significantly slower but more accurate.")
+        
         # Run validation button
         if st.button("🚀 Clean Email List", type="primary"):
             st.subheader("⚙️ Processing...")
@@ -159,7 +245,7 @@ if uploaded_file is not None:
             
             # Process the CSV
             start_time = time.time()
-            cleaned_df, valid_count, invalid_count = process_csv(df.copy(), progress_bar, status_text)
+            cleaned_df, valid_count, invalid_count = process_csv(df.copy(), progress_bar, status_text, use_smtp=use_smtp)
             processing_time = time.time() - start_time
             
             # Clear progress indicators
@@ -184,13 +270,15 @@ if uploaded_file is not None:
             
             # Download button
             st.subheader("💾 Download Results")
-            st.markdown(get_download_link(cleaned_df), unsafe_allow_html=True)
+            zip_buffer = create_download_zip(cleaned_df)
+            st.markdown(get_download_link(zip_buffer), unsafe_allow_html=True)
             
-            # Option to filter and show only valid emails
-            if st.checkbox("Show only valid emails"):
-                valid_df = cleaned_df[cleaned_df['Status'] == 'Valid']
-                st.dataframe(valid_df, use_container_width=True)
-                st.markdown(get_download_link(valid_df), unsafe_allow_html=True)
+            st.info("""
+            📦 **ZIP file contains 3 CSV files:**
+            - `full_results.csv` - All emails with Status column
+            - `valid_emails.csv` - Only valid emails
+            - `invalid_emails.csv` - Only invalid emails
+            """)
 
 else:
     st.info("👆 Please upload a CSV file to get started")
